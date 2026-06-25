@@ -1,0 +1,16 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+qdrant-client==1.12.1
+sentence-transformers==3.3.1
+rank-bm25==0.2.2
+redis[hiredis]==5.2.1
+langfuse==2.58.1
+prometheus-client==0.21.1
+httpx==0.28.1
+pydantic==2.10.4
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+PyJWT>=2.8.0
+torch==2.5.1+cpu
+transformers==4.47.1
+numpy==1.26.4

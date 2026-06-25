@@ -1,0 +1,383 @@
+You are an expert AI system builder. Your task is to build the **AI Knowledge Centre** — a production-grade, fully local Retrieval-Augmented Generation (RAG) system that runs on a Windows 11 server (WSL2/Docker Desktop) with CPU‑only inference and 32 GB RAM. The system must serve up to 20 concurrent users over HTTPS, with JWT authentication, rate limiting, full observability, automated backups, and a web interface. Everything is containerised with Docker Compose; a single `docker compose up -d` must start all services.
+
+---
+
+## Process
+
+1. **Read the entire specification below.**
+2. **Create a detailed checklist** of every service, configuration file, application module, database table, environment variable, and test that needs to be built. Group by category (e.g. Infrastructure, Backend, Frontend, Observability, Security, Backup). The checklist must be comprehensive – no step may be omitted.
+3. **After I confirm the checklist**, implement each item sequentially. For every file write the exact content and place it in the correct directory (provided).
+4. **After implementation**, verify the system against the acceptance criteria listed at the end of this document.
+
+---
+
+## System Specification
+
+### 1. High‑Level Architecture
+
+**Layers:**
+
+| Layer | Components (Docker Services) |
+|-------|------------------------------|
+| Edge/Security | nginx (reverse proxy + SSL) |
+| Frontend | openwebui, admin-panel (Streamlit) |
+| API Gateway | api-gateway (FastAPI, JWT, rate limiting) |
+| Processing | ingestion-worker (Celery), query-engine |
+| AI/LLM | ollama (Llama 3 8B + nomic-embed-text) |
+| Storage | qdrant, postgres, minio, redis |
+| Logging | loki, promtail |
+| Observability | langfuse, prometheus, grafana |
+
+All services communicate on a dedicated Docker bridge network `kc-net` (subnet `172.20.0.0/16`). **Only ports 80 and 443 are exposed to the LAN**; every other service binds to `127.0.0.1`.
+
+---
+
+### 2. Hardware & Environment
+
+- **Server**: Dell Precision 5080 Tower, Intel Xeon, 32 GB RAM, 2 TB HDD (SSD recommended).  
+- **OS**: Windows 11 with WSL2, Docker Desktop 4.x.  
+- **LLM**: Ollama running Llama 3 8B (CPU‑only, ~10–15 s per query).  
+- **Documents**: 100–200 GB of PDF, DOCX, XLSX, TXT files.  
+- **Static LAN IP**: assign a static IP (e.g. 192.168.1.100) and use it in all configuration.
+
+---
+
+### 3. Directory Structure (created on the server)
+
+```
+knowledge-centre/
+├── docker-compose.yml
+├── docker-compose.override.yml   # (dev overrides, optional)
+├── .env                          # secrets (NEVER commit)
+├── .env.example
+├── .gitignore
+├── prometheus.yml
+├── loki-config.yml
+├── promtail-config.yml
+├── nginx/
+│   ├── nginx.conf
+│   └── ssl/
+│       ├── cert.pem
+│       └── key.pem
+├── api-gateway/
+│   ├── Dockerfile
+│   ├── main.py
+│   ├── auth.py
+│   ├── rate_limiter.py
+│   └── requirements.txt
+├── ingestion-worker/
+│   ├── Dockerfile
+│   ├── worker.py
+│   ├── tasks.py
+│   ├── parsers.py
+│   ├── chunker.py
+│   └── requirements.txt
+├── query-engine/
+│   ├── Dockerfile
+│   ├── engine.py
+│   ├── hybrid_search.py
+│   ├── reranker.py
+│   ├── prompt_builder.py
+│   └── requirements.txt
+├── admin-panel/
+│   ├── Dockerfile
+│   ├── app.py
+│   └── requirements.txt
+├── scripts/
+│   └── init.sql                 # PostgreSQL initialisation
+├── docs/                        # drop documents here for ingestion
+├── models/                      # persisted Ollama models
+├── data/                        # persistent Docker volumes
+│   ├── qdrant/
+│   ├── postgres/
+│   ├── minio/
+│   ├── redis/
+│   ├── loki/
+│   ├── grafana/
+│   └── langfuse/
+├── backups/                     # output of backup tasks
+└── logs/                        # application log files
+```
+
+---
+
+### 4. Docker Compose – Service Specifications
+
+Each service must have a **healthcheck** (unless noted) and `restart: unless-stopped`. Dependencies should use `depends_on` with `condition: service_healthy` where possible.
+
+| # | Service | Image / Build | Container Name | Ports (host:container) | Key Environment / Command |
+|---|---------|---------------|----------------|------------------------|---------------------------|
+| 1 | **nginx** | `nginx:alpine` | `kc-nginx` | `80:80`, `443:443` | Mounts: `./nginx/nginx.conf:/etc/nginx/nginx.conf:ro`, `./nginx/ssl:/etc/nginx/ssl:ro`<br>Health: `wget -qO- http://localhost/health` |
+| 2 | **ollama** | `ollama/ollama:latest` | `kc-ollama` | `127.0.0.1:11434:11434` | Volume: `./models:/root/.ollama`<br>Health: `curl -f http://localhost:11434/api/tags` (start_period 60s) |
+| 3 | **qdrant** | `qdrant/qdrant:v1.9.0` | `kc-qdrant` | `127.0.0.1:6333:6333`, `127.0.0.1:6334:6334` | Volume: `./data/qdrant:/qdrant/storage`<br>Health: `curl -f http://localhost:6333/readyz` |
+| 4 | **postgres** | `postgres:16-alpine` | `kc-postgres` | `127.0.0.1:5432:5432` | Env: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` from `.env`<br>Volume: `./data/postgres:/var/lib/postgresql/data`<br>Mount `./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql`<br>Health: `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` |
+| 5 | **redis** | `redis:7-alpine` | `kc-redis` | `127.0.0.1:6379:6379` | Command: `redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru`<br>Volume: `./data/redis:/data`<br>Health: `redis-cli ping` |
+| 6 | **minio** | `minio/minio:latest` | `kc-minio` | `127.0.0.1:9000:9000`, `127.0.0.1:9001:9001` | Command: `server /data --console-address ':9001'`<br>Env: `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`<br>Volume: `./data/minio:/data`<br>Health: `curl -f http://localhost:9000/minio/health/live` |
+| 7 | **api-gateway** | build: `./api-gateway` | `kc-api` | `127.0.0.1:8000:8000` | Env: `DATABASE_URL`, `REDIS_URL`, `QDRANT_URL`, `OLLAMA_URL`, `JWT_SECRET`, `JWT_EXPIRE_HOURS=8`, `RATE_LIMIT_PER_MINUTE`, `LANGFUSE_*`, `LOG_LEVEL`<br>Volumes: `./docs:/app/docs`, `./logs:/app/logs`<br>Health: `curl -f http://localhost:8000/health` |
+| 8 | **ingestion-worker** | build: `./ingestion-worker` | `kc-ingestion` | none (internal) | Command: `celery -A tasks worker --loglevel=info --concurrency=2 -Q ingestion`<br>Env: `CELERY_BROKER_URL=redis://redis:6379/1`, `CELERY_RESULT_BACKEND=redis://redis:6379/2`, `QDRANT_URL`, `OLLAMA_URL`, `MINIO_URL`, `MINIO_USER`, `MINIO_PASSWORD`, `DATABASE_URL`, `MAX_RETRIES=3`, `RETRY_BACKOFF=60`<br>Volumes: `./docs:/app/docs`, `./logs:/app/logs` |
+| 9 | **celery-beat** | build: `./ingestion-worker` | `kc-celery-beat` | none | Command: `celery -A tasks beat --loglevel=info`<br>Env: `CELERY_BROKER_URL`, `DATABASE_URL` |
+|10 | **query-engine** | build: `./query-engine` | `kc-query` | `127.0.0.1:8001:8001` | Env: `QDRANT_URL`, `OLLAMA_URL`, `REDIS_URL=redis://redis:6379/3`, `RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2`, `TOP_K_VECTOR=20`, `TOP_K_BM25=20`, `TOP_K_RERANKED=5`, `LANGFUSE_*`<br>Health: `curl -f http://localhost:8001/health` |
+|11 | **openwebui** | `ghcr.io/open-webui/open-webui:main` | `kc-webui` | `127.0.0.1:3000:8080` | Env: `OLLAMA_BASE_URL=http://ollama:11434`, `WEBUI_SECRET_KEY`, `WEBUI_AUTH=true`<br>Volume: `./data/openwebui:/app/backend/data` |
+|12 | **admin-panel** | build: `./admin-panel` | `kc-admin` | `127.0.0.1:8501:8501` | Env: `API_URL=http://api-gateway:8000`, `ADMIN_SECRET` |
+|13 | **langfuse** | `langfuse/langfuse:latest` | `kc-langfuse` | `127.0.0.1:3001:3000` | Env: `DATABASE_URL` (points to a separate `langfuse` DB on postgres), `NEXTAUTH_SECRET`, `SALT`, `NEXTAUTH_URL=https://$SERVER_IP/langfuse` |
+|14 | **loki** | `grafana/loki:2.9.0` | `kc-loki` | `127.0.0.1:3100:3100` | Volume: `./loki-config.yml:/etc/loki/config.yml`, `./data/loki:/loki` |
+|15 | **promtail** | `grafana/promtail:2.9.0` | `kc-promtail` | none | Volumes: `./promtail-config.yml:/etc/promtail/config.yml`, `./logs:/var/log/kc`, `/var/lib/docker/containers:/var/lib/docker/containers:ro` |
+|16 | **prometheus** | `prom/prometheus:latest` | `kc-prometheus` | `127.0.0.1:9090:9090` | Volume: `./prometheus.yml:/etc/prometheus/prometheus.yml` |
+|17 | **grafana** | `grafana/grafana:latest` | `kc-grafana` | `127.0.0.1:4000:3000` | Env: `GF_SECURITY_ADMIN_PASSWORD`, `GF_SERVER_ROOT_URL`, `GF_SERVER_SERVE_FROM_SUB_PATH`<br>Volume: `./data/grafana:/var/lib/grafana` |
+
+All services are on the network `kc-net` with `driver: bridge`, `subnet: 172.20.0.0/16`.
+
+---
+
+### 5. Environment Variables (`.env`)
+
+The `.env` file **must** contain these keys (fill with strong random values, min 20 chars, JWT secret 64 char hex):
+
+```
+SERVER_IP=192.168.1.100
+POSTGRES_DB=knowledge_centre
+POSTGRES_USER=kcadmin
+POSTGRES_PASSWORD=<strong_password>
+MINIO_USER=minioadmin
+MINIO_PASSWORD=<strong_password>
+JWT_SECRET=<64_char_hex>
+WEBUI_SECRET_KEY=<64_char_hex>
+ADMIN_SECRET=<admin_panel_password>
+LANGFUSE_SECRET_KEY=<random>
+LANGFUSE_PUBLIC_KEY=<random>
+LANGFUSE_SALT=<random>
+RATE_LIMIT_PER_MINUTE=20
+GRAFANA_PASSWORD=<grafana_admin_password>
+```
+
+---
+
+### 6. Nginx Configuration
+
+Create `nginx/nginx.conf` with:
+
+- HTTP → HTTPS redirect on port 80.
+- HTTPS on port 443 with self‑signed SSL (cert/key from `./ssl/`).
+- Location `/` → proxy to `openwebui:8080` (support WebSocket upgrades).
+- Location `/api/` → proxy to `api-gateway:8000/`.
+- Location `/admin/` → proxy to `admin-panel:8501/` (optional IP restriction).
+- Location `/grafana/` → proxy to `grafana:3000/`.
+- Location `/langfuse/` → proxy to `langfuse:3000/`.
+- `/health` returns 200.
+
+---
+
+### 7. PostgreSQL Schema
+
+Create an SQL init script (`scripts/init.sql`) that creates the following tables:
+
+**users** (id UUID PK, username UNIQUE, email UNIQUE, password bcrypt hash, role, department, is_active, last_login, created_at, created_by FK)
+
+**documents** (id UUID PK, filename, file_type, department, file_size_mb, minio_path, status (queued/processing/indexed/failed), chunk_count, version, checksum SHA256, is_latest BOOL, error_msg, retry_count, uploaded_by FK, uploaded_at, indexed_at)
+
+**queries** (id UUID PK, user_id FK, session_id, question, answer, sources JSONB, filters_applied JSONB, latency_ms, vector_search_ms, reranker_ms, llm_ms, tokens_used, feedback smallint, feedback_note, langfuse_trace, created_at)
+
+**ingestion_jobs** (id UUID PK, document_id FK, celery_task_id, status, attempt, error_msg, stack_trace, started_at, completed_at, created_at)
+
+**ragas_evaluations** (id UUID PK, evaluated_at, sample_size, faithfulness float, answer_relevancy float, context_precision float, context_recall float, avg_latency_ms)
+
+Add indexes: on queries (user_id), queries (created_at DESC), documents (status), documents (department).
+
+Also create a separate database `langfuse` (Langfuse will auto‑migrate on first start).
+
+---
+
+### 8. Redis Usage
+
+Use four logical databases:
+- `0` – cache / rate‑limits (api‑gateway, query‑engine)
+- `1` – Celery broker (ingestion‑worker)
+- `2` – Celery results backend
+- `3` – query‑engine cache
+
+---
+
+### 9. API Gateway (FastAPI)
+
+Provide a `Dockerfile` and Python code (`main.py`, `auth.py`, `rate_limiter.py`).  
+**Endpoints:**
+
+- `GET /health` – return `{"status":"ok"}`
+- `POST /api/auth/login` – validate credentials, return JWT.
+- `POST /api/auth/refresh` – refresh token.
+- `POST /api/auth/logout` – blacklist JWT in Redis.
+- `POST /api/query` – receives `{question, filters?}`, passes to query‑engine, returns streaming or full answer with citations. Logs to PostgreSQL and Langfuse.
+- `POST /api/ingest` – admin only; accepts file or document_id, enqueues Celery task.
+- `GET /api/documents` – list documents (with pagination, filters).
+- `DELETE /api/documents/{id}` – admin only; triggers deletion of vectors and MinIO object.
+
+**JWT auth:** HS256, payload `{user_id, username, role, exp}`, 8‑hour expiry, refresh within 1h of expiry. Blacklist on logout with Redis TTL.
+
+**Rate limiting:** sliding window per user, using Redis. Endpoint‑specific limits:  
+- `/api/query` 20/min per user  
+- `/api/ingest` 10/h per admin  
+- `/api/auth/login` 5/15min per IP  
+
+**All environment variables** must be read from the environment (docker‑compose passes them). Dependency: `fastapi`, `uvicorn`, `sqlalchemy`, `asyncpg`, `redis`, `python-jose`, `bcrypt`, `langfuse`, `python-multipart`, `aiofiles`.
+
+---
+
+### 10. Ingestion Worker (Celery)
+
+Build in `ingestion-worker/`.  
+**Dockerfile** based on `python:3.11-slim`.  
+**`tasks.py`** defines Celery app (broker `redis://redis:6379/1`) and these tasks:
+
+1. **`ingest_document(document_id, file_path, department, file_type)`**  
+   - Retries 3× with exponential backoff (60s, 120s, 240s).  
+   - Timeout: 30 min.  
+   - **Steps**:  
+     1. Update document status to `processing` in PostgreSQL.  
+     2. If file already exists (matched by filename+department), delete old Qdrant vectors + BM25 entries + update version.  
+     3. Parse file with **Unstructured.io** (`partitioner.auto`). For scanned PDFs, use `pdf2image` + `pytesseract`.  
+     4. Chunk text according to document type:  
+        - SOPs/policies: 512 tokens, 50 overlap (RecursiveCharacterTextSplitter)  
+        - Manuals: 768 tokens, 100 overlap  
+        - Excel: 256 tokens, no overlap (row‑wise)  
+        - Notes: 384 tokens, 64 overlap  
+     5. For each chunk, generate embedding using Ollama (`nomic-embed-text`, 768‑dim).  
+     6. Upload chunks to Qdrant collection `documents` with payload: `{text, filename, page, section, document_id, department, file_type, uploaded_at, version}`.  
+     7. Build/update BM25 in‑memory index (using `rank_bm25`) and persist to Redis DB 3 or a file; the query‑engine will load it.  
+     8. Upload original file to MinIO bucket `documents` under `/{department}/{filename}`.  
+     9. Update document status to `indexed`, set chunk_count, indexed_at.  
+     10. On failure: status `failed`, write error to `ingestion_jobs`, send alert (webhook/log).  
+2. **`delete_document_vectors(document_id)`** – delete all Qdrant points with matching `document_id`.  
+3. **`run_ragas_evaluation()`** – weekly, sample 50 answered queries with feedback, compute faithfulness, answer relevancy, context precision, recall, store results.  
+4. **`backup_postgres()`** – nightly at 03:00, `pg_dump` gzip → MinIO `backups/postgres/YYYY-MM-DD.sql.gz`, retain 30 days.  
+5. **`backup_qdrant()`** – weekly Sun 03:30, snapshot via Qdrant API → MinIO `backups/qdrant/`.
+
+**Celery Beat schedule** (in `tasks.py`):  
+- `backup-postgres-nightly` at `crontab(hour=3, minute=0)`  
+- `backup-qdrant-weekly` at `crontab(hour=3, minute=30, day_of_week=0)`  
+- `ragas-evaluation-weekly` at `crontab(hour=2, minute=0, day_of_week=0)`
+
+**Worker** (`worker.py`): just starts Celery worker listening on queue `ingestion`.  
+
+---
+
+### 11. Query Engine
+
+Build in `query-engine/`.  
+**Dockerfile** as a FastAPI service (port 8001).  
+**`engine.py`** provides `/health` and `/query` (internal API).  
+**Query pipeline:**
+
+1. Receive `question`, optional `filters` (department, file_type, date_range, document name, version).
+2. Embed question with `nomic-embed-text` → 768‑d vector.
+3. **Hybrid search**:  
+   - Qdrant vector search: top‑20, with optional payload filters.  
+   - BM25 keyword search: top‑20 using in‑memory index (loaded from Redis/file at startup).  
+   - **Reciprocal Rank Fusion**: score = 1/(k+rank), k=60, merge & deduplicate → top‑40.  
+4. **Reranker**: download `cross-encoder/ms-marco-MiniLM-L-6-v2` on startup, score all 40 (query, chunk) pairs, keep top‑5.  
+5. **Prompt assembly**: use the exact template below.
+6. **LLM generation**: call Ollama Llama 3 8B (streaming if possible), concatenate answer.
+7. Return answer + `sources` list (filename, page, section, score).
+8. Log full trace to Langfuse (spans for each step). Emit Prometheus metrics (query counter, latency histogram, etc.).
+9. Cache identical questions using Redis (hashing question + filters) to skip re‑computation.
+
+**Prompt Template:**
+```
+SYSTEM:
+You are a precise assistant for engineering, operations, and maintenance teams.
+Rules:
+1. Answer ONLY using the provided context. Never use external knowledge.
+2. Always cite: [Source: {filename}, Page {page}, Section: {section}]
+3. If the answer is not in the context, respond exactly:
+   "This information was not found in the available documents.
+    Recommended documents to check manually: {suggest_category}"
+4. For safety-critical procedures, add: WARNING: Always verify with
+   the original document before performing this procedure.
+5. Be concise. Use numbered steps for procedures. Use bullet points for lists.
+
+CONTEXT:
+[Chunk 1 - Score: 0.94]: {text} [Source: {filename}, Page {page}]
+[Chunk 2 - Score: 0.91]: {text} [Source: {filename}, Page {page}]
+...
+
+QUESTION: {user_question}
+
+ANSWER:
+```
+
+---
+
+### 12. OpenWebUI & Admin Panel
+
+- **OpenWebUI**: the official image already set up. It will connect to Ollama via the env variable; user management is handled by the API gateway (custom OpenWebUI integration may be needed, but at minimum we use its built‑in auth with `WEBUI_AUTH=true`). The frontend is accessed via Nginx at `/`.
+- **Admin Panel (Streamlit)**: Build a simple Streamlit app that uses the API gateway’s admin endpoints. Features: document upload, ingestion status view, document library (with version, delete), user management, query logs, DLQ viewer, backup status. Protect with `ADMIN_SECRET` (prompt on launch).  
+
+---
+
+### 13. Observability
+
+- **Prometheus**: scrape config in `prometheus.yml` to scrape `api-gateway:8000` and `query-engine:8001`. (Metrics: query count, latency, ingestion jobs, etc.)
+- **Loki + Promtail**: `loki-config.yml` minimal config. Promtail reads Docker container logs from `/var/lib/docker/containers` and ships to Loki. Logs from our apps must be structured JSON with at least `timestamp`, `level`, `service`, `event`.
+- **Grafana**: connect to Prometheus and Loki as data sources. Pre‑build dashboards: System Overview, Query Performance, Pipeline Breakdown, User Activity, Ingestion Health, Quality Scorecard, Storage & Capacity, Log Explorer. These can be auto‑provisioned via config files.
+- **Langfuse**: captures per‑query traces (spans for embedding, vector search, BM25, reranker, prompt build, LLM generation). The query‑engine must send them using the Langfuse Python SDK.
+
+---
+
+### 14. Security
+
+- **Firewall (Windows)**: allow inbound TCP 80, 443 from LAN subnet; block all others.
+- **SSL**: generate self‑signed cert (`openssl req -x509 -nodes ...`). Use `mkcert` for a trusted cert if desired.
+- **Secrets**: all in `.env`, never in code. `.gitignore` excludes `.env` and `data/`, `models/`.
+- **Container images**: pin versions except Ollama.
+- **Password hashing**: bcrypt cost 12.
+- **Question text**: hash before logging.
+
+---
+
+### 15. Backup & Disaster Recovery
+
+- Automated backups as Celery tasks (see Section 10).
+- Verification: PostgreSQL backup tested with `pg_restore --list`; Qdrant snapshot size > 1 MB.
+- Restore procedure (to be documented in the system):
+  1. Reinstall Docker, copy project folder, restore `.env`.
+  2. Start postgres alone → `docker exec` restore dump.
+  3. Start qdrant → upload snapshot.
+  4. Start minio → copy raw files.
+  5. `docker compose up -d` all services.
+  6. Pull Ollama models if lost.
+
+---
+
+### 16. Testing Plan
+
+Implement tests (using `pytest` for Python) for:
+
+- Unit tests: chunker, embedding wrapper, hybrid search RRF, reranker, prompt builder, JWT utils, rate limiter, document versioning logic.
+- Integration tests (against running services): upload PDF → query, XLSX upload, document update, department filter, rate limit 429, role permissions (engineer cannot upload), expired JWT, OCR of scanned PDF, corrupt file handling, Redis queue restart.
+- Load test (Locust): 20 users, 10 minutes, 70% factual / 20% procedural / 10% nonsense queries → P95 < 15s, no crashes.
+- Acceptance checklist (must all pass):
+  - `docker compose up -d` starts all 17 services as healthy.
+  - Ingest a 50‑page PDF in <5 min, query returns correct cited answer.
+  - Re‑upload same file with updated content → answer reflects new version.
+  - Engineer cannot access admin panel (403).
+  - Rate limit triggers 429.
+  - HTTPS works with Nginx.
+  - Grafana shows query metrics.
+  - Langfuse trace present.
+  - Nightly backup appears in MinIO.
+  - All data survives `docker compose down && up -d`.
+  - Loki logs visible in Grafana.
+
+---
+
+## Implementation Notes
+
+- All code must be written in Python (FastAPI, Celery, Streamlit), with proper error handling and logging.
+- Use `Unstructured.io` for document parsing (`unstructured[all-docs]`). Install system dependencies in Dockerfiles (`libreoffice`, `poppler-utils`, `tesseract-ocr`, etc.).
+- In Qdrant, create a collection `documents` with vector size 768, cosine distance.
+- The BM25 index can be maintained as an in‑memory `rank_bm25` object serialised to Redis (or a local file) and reloaded on query‑engine startup.
+- All inter‑service communication must use container names (e.g. `http://qdrant:6333`).
+- For Langfuse, use the Python SDK `langfuse>=2.0.0`.
+
+---
+
+**Now, produce your detailed checklist before writing any code. The checklist must enumerate every file, service, configuration, environment variable, and test.** After I review and approve the checklist, you will implement everything.

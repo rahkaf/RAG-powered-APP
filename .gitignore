@@ -1,0 +1,33 @@
+# Environment & secrets
+.env
+
+# Docker persistent data
+data/
+models/
+backups/
+logs/
+
+# SSL certificates
+nginx/ssl/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
